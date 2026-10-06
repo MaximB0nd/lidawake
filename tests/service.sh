@@ -5,8 +5,17 @@ project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_dir"
 
 plutil -lint service/local.lidawake.plist
+plutil -lint service/local.lidawake.recover.plist
 if [ "$(plutil -extract RunAtLoad raw service/local.lidawake.plist)" != false ]; then
   printf 'Service must not start at boot\n' >&2
+  exit 1
+fi
+if [ "$(plutil -extract RunAtLoad raw service/local.lidawake.recover.plist)" != false ]; then
+  printf 'Recovery job must not start at boot\n' >&2
+  exit 1
+fi
+if [ "$(plutil -extract StartInterval raw service/local.lidawake.recover.plist)" != 15 ]; then
+  printf 'Recovery job must check for an orphaned session every 15 seconds\n' >&2
   exit 1
 fi
 if grep -q '<key>KeepAlive</key>' service/local.lidawake.plist; then

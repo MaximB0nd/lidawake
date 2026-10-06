@@ -5,9 +5,12 @@ SOURCE_DIR=${0:A:h}
 SERVICE_DIR='/Library/Application Support/lidawake'
 SERVICE_SCRIPT="$SERVICE_DIR/lidawake"
 SERVICE_CONFIG="$SERVICE_DIR/lidawake.conf"
+RECOVER_SCRIPT="$SERVICE_DIR/recover"
 SERVICE_MARKER="$SERVICE_DIR/active"
 SERVICE_PLIST='/Library/LaunchDaemons/local.lidawake.plist'
 SERVICE_LABEL='system/local.lidawake'
+RECOVER_PLIST='/Library/LaunchDaemons/local.lidawake.recover.plist'
+RECOVER_LABEL='system/local.lidawake.recover'
 
 usage() {
   print -u2 'Usage: lidawake service start | stop | status'
@@ -47,7 +50,7 @@ remove_installed_files() {
     print -u2 'Refusing to remove files through a symbolic link.'
     return 1
   fi
-  /bin/rm -f "$SERVICE_SCRIPT" "$SERVICE_CONFIG" "$SERVICE_PLIST" || return 1
+  /bin/rm -f "$SERVICE_SCRIPT" "$SERVICE_CONFIG" "$RECOVER_SCRIPT" "$SERVICE_PLIST" "$RECOVER_PLIST" || return 1
   if [[ -d $SERVICE_DIR ]]; then
     /bin/rmdir "$SERVICE_DIR" || return 1
   fi
@@ -103,6 +106,12 @@ stop_service() {
     fi
   fi
 
+  if /bin/launchctl print "$RECOVER_LABEL" >/dev/null 2>&1; then
+    if ! /bin/launchctl bootout "$RECOVER_LABEL"; then
+      print -u2 'Could not stop the recovery job.'
+      return 1
+    fi
+  fi
   remove_installed_files || return 1
   print 'Service: stopped'
 }
@@ -129,7 +138,10 @@ start_service() {
   if job_info >/dev/null; then
     /bin/launchctl bootout "$SERVICE_LABEL" || return 1
   fi
-  if [[ -L $SERVICE_DIR || -L $SERVICE_SCRIPT || -L $SERVICE_CONFIG || -L $SERVICE_PLIST ]]; then
+  if /bin/launchctl print "$RECOVER_LABEL" >/dev/null 2>&1; then
+    /bin/launchctl bootout "$RECOVER_LABEL" || return 1
+  fi
+  if [[ -L $SERVICE_DIR || -L $SERVICE_SCRIPT || -L $SERVICE_CONFIG || -L $RECOVER_SCRIPT || -L $SERVICE_PLIST || -L $RECOVER_PLIST ]]; then
     print -u2 'Refusing to install through a symbolic link.'
     return 1
   fi
@@ -142,12 +154,20 @@ start_service() {
     return 1
   fi
   /usr/bin/plutil -lint "$SOURCE_DIR/service/local.lidawake.plist" >/dev/null || return 1
+  /usr/bin/plutil -lint "$SOURCE_DIR/service/local.lidawake.recover.plist" >/dev/null || return 1
   /usr/bin/install -d -o root -g wheel -m 755 "$SERVICE_DIR" || return 1
   if ! /usr/bin/install -o root -g wheel -m 755 "$SOURCE_DIR/lidawake" "$SERVICE_SCRIPT" ||
      ! /usr/bin/install -o root -g wheel -m 644 "$SOURCE_DIR/lidawake.conf" "$SERVICE_CONFIG" ||
-     ! /usr/bin/install -o root -g wheel -m 644 "$SOURCE_DIR/service/local.lidawake.plist" "$SERVICE_PLIST"; then
+     ! /usr/bin/install -o root -g wheel -m 755 "$SOURCE_DIR/service/recover" "$RECOVER_SCRIPT" ||
+     ! /usr/bin/install -o root -g wheel -m 644 "$SOURCE_DIR/service/local.lidawake.plist" "$SERVICE_PLIST" ||
+     ! /usr/bin/install -o root -g wheel -m 644 "$SOURCE_DIR/service/local.lidawake.recover.plist" "$RECOVER_PLIST"; then
     print -u2 'Could not install service files.'
     remove_installed_files
+    return 1
+  fi
+  if ! /bin/launchctl bootstrap system "$RECOVER_PLIST"; then
+    print -u2 'Could not load the recovery job.'
+    stop_service
     return 1
   fi
   if ! /bin/launchctl bootstrap system "$SERVICE_PLIST"; then

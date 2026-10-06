@@ -1,0 +1,48 @@
+#!/bin/zsh
+set -u
+
+SERVICE_MARKER='/Library/Application Support/lidawake/active'
+SERVICE_LABEL='system/local.lidawake'
+LAUNCHCTL=/bin/launchctl
+IOREG=/usr/sbin/ioreg
+PMSET=/usr/bin/pmset
+
+recover_service() {
+  [[ -e $SERVICE_MARKER ]] || return 0
+
+  local job state
+  job=$("$LAUNCHCTL" print "$SERVICE_LABEL" 2>/dev/null) || job=''
+  if [[ $job == *'state = running'* ]]; then
+    return 0
+  fi
+
+  state=$("$IOREG" -r -n IOPMrootDomain -d 1) || {
+    print -u2 'Could not read system sleep state; recovery will retry.'
+    return 1
+  }
+  if [[ $state == *'"SleepDisabled" = Yes'* ]]; then
+    if ! "$PMSET" -a disablesleep 0; then
+      print -u2 'Could not restore sleep; recovery will retry.'
+      return 1
+    fi
+    state=$("$IOREG" -r -n IOPMrootDomain -d 1) || return 1
+  fi
+  if [[ $state != *'"SleepDisabled" = No'* ]]; then
+    print -u2 'System sleep is still disabled; recovery will retry.'
+    return 1
+  fi
+
+  /bin/rm -f "$SERVICE_MARKER" || return 1
+  print 'Recovered normal sleep after service exit.'
+}
+
+case ${1:-run} in
+  run)
+    if (( EUID != 0 )); then
+      print -u2 'Run this command with sudo.'
+      exit 1
+    fi
+    recover_service
+    ;;
+  *) exit 2 ;;
+esac

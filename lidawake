@@ -187,6 +187,12 @@ case ${1:-run} in
     trap 'exit 143' TERM
     trap 'exit 129' HUP
 
+    if [[ $SERVICE_MODE == true ]]; then
+      if ! /usr/bin/touch "$SERVICE_MARKER" || ! /bin/chmod 600 "$SERVICE_MARKER"; then
+        print -u2 'Could not record service state.'
+        exit 1
+      fi
+    fi
     if ! "$PMSET" -a disablesleep 1; then
       print -u2 'Could not disable system sleep.'
       exit 1
@@ -196,13 +202,6 @@ case ${1:-run} in
       print -u2 'System sleep did not become disabled.'
       exit 1
     fi
-    if [[ $SERVICE_MODE == true ]]; then
-      if ! /usr/bin/touch "$SERVICE_MARKER" || ! /bin/chmod 600 "$SERVICE_MARKER"; then
-        print -u2 'Could not record service state.'
-        exit 1
-      fi
-    fi
-
     deadline=''
     if [[ $minutes != infinite ]]; then
       deadline=$(( $($DATE +%s) + minutes * 60 ))

@@ -73,20 +73,23 @@ The service log is `/var/log/lidawake.log`. `stop` unloads the job, restores
 normal sleep, and removes the installed copies. Stop and start again after
 editing `lidawake.conf`; a running service uses the copy made at startup.
 
-The service **does not start automatically after reboot** and is not restarted
-after a crash or battery cutoff. If `service status` reports recovery needed,
-run `sudo ./lidawake service stop`. This also handles a service that exited
-without restoring sleep. A forced kill, crash, or power loss can still leave
-sleep disabled until recovery runs. The service mode needs administrator
-privileges to install and control its system job.
+The working session **does not start automatically after reboot** and is not
+restarted after a process crash or battery cutoff. A separate `launchd` job
+checks every 15 seconds whether the service exited unexpectedly; if so, it
+restores normal sleep. This check may run later if macOS is asleep or delays
+scheduled jobs.
+After an unexpected exit, run `sudo ./lidawake service stop` to remove the
+installed service and recovery job. The service mode needs administrator
+privileges to install and control its system jobs.
 
 ## Stop and recover
 
 - Press **Control-C** in the Terminal running `lidawake` to restore normal
   sleep. A finite timer or the battery threshold will also stop the session.
 - If the process was forcibly killed or the Mac crashed, normal sleep might
-  remain disabled. After reopening the Mac, check `./lidawake status`. If the
-  `lidawake` session has stopped but sleep is still disabled, run
+  remain disabled, especially in Terminal mode or before service recovery runs.
+  After reopening the Mac, check `./lidawake status`. If the `lidawake` session
+  has stopped but sleep is still disabled, run
   `sudo ./lidawake restore`. This changes the system-wide sleep setting.
 - `restore` changes the system sleep setting; it does not stop a running
   `lidawake` process. Stop that process first, or it can disable sleep again.
@@ -115,8 +118,10 @@ Run the config and command-line checks without `sudo`:
 sh tests/config.sh
 sh tests/service.sh
 /bin/zsh tests/service_cleanup.zsh
+/bin/zsh tests/recovery.zsh
 /bin/zsh -n lidawake
 /bin/zsh -n service-control
+/bin/zsh -n service/recover
 ```
 
 These checks do not change system power settings. A physical closed-lid test
