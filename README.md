@@ -1,6 +1,6 @@
 # lidawake
 
-![A closed laptop under a moonlit sky. Close the lid. Keep the work going.](assets/hero.png)
+![Three colorful agents working around a closed laptop. Close the lid. Keep the work going.](assets/hero.png)
 
 Keep a MacBook running with its lid closed while turning off the display.
 `lidawake` is a small zsh script that uses tools included with macOS. Run it
