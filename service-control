@@ -1,0 +1,202 @@
+#!/bin/zsh
+set -u
+
+SOURCE_DIR=${0:A:h}
+SERVICE_DIR='/Library/Application Support/lidawake'
+SERVICE_SCRIPT="$SERVICE_DIR/lidawake"
+SERVICE_CONFIG="$SERVICE_DIR/lidawake.conf"
+SERVICE_MARKER="$SERVICE_DIR/active"
+SERVICE_PLIST='/Library/LaunchDaemons/local.lidawake.plist'
+SERVICE_LABEL='system/local.lidawake'
+
+usage() {
+  print -u2 'Usage: lidawake service start | stop | status'
+}
+
+require_root() {
+  if (( EUID != 0 )); then
+    print -u2 'Run this command with sudo.'
+    return 1
+  fi
+}
+
+job_info() {
+  /bin/launchctl print "$SERVICE_LABEL" 2>/dev/null
+}
+
+job_running() {
+  local info
+  info=$(job_info) || return 1
+  [[ $info == *'state = running'* ]]
+}
+
+sleep_state() {
+  local state
+  state=$(/usr/sbin/ioreg -r -n IOPMrootDomain -d 1) || return 1
+  if [[ $state == *'"SleepDisabled" = Yes'* ]]; then
+    print disabled
+  elif [[ $state == *'"SleepDisabled" = No'* ]]; then
+    print allowed
+  else
+    return 1
+  fi
+}
+
+remove_installed_files() {
+  if [[ -L $SERVICE_DIR ]]; then
+    print -u2 'Refusing to remove files through a symbolic link.'
+    return 1
+  fi
+  /bin/rm -f "$SERVICE_SCRIPT" "$SERVICE_CONFIG" "$SERVICE_PLIST" || return 1
+  if [[ -d $SERVICE_DIR ]]; then
+    /bin/rmdir "$SERVICE_DIR" || return 1
+  fi
+}
+
+stop_service() {
+  require_root || return 1
+  local was_running=false attempt current_state
+  if job_info >/dev/null; then
+    if job_running; then
+      was_running=true
+      if ! /bin/launchctl kill TERM "$SERVICE_LABEL"; then
+        print -u2 'Could not request graceful service shutdown; unloading the service.'
+      else
+        for attempt in {1..20}; do
+          current_state=$(sleep_state) || {
+            print -u2 'Could not verify system sleep state.'
+            return 1
+          }
+          if [[ ! -e $SERVICE_MARKER && $current_state == allowed ]]; then
+            break
+          fi
+          /bin/sleep 0.25
+        done
+      fi
+    fi
+    if ! /bin/launchctl bootout "$SERVICE_LABEL"; then
+      print -u2 'Could not stop the launchd service.'
+      return 1
+    fi
+  fi
+
+  if [[ -e $SERVICE_MARKER || $was_running == true ]]; then
+    for attempt in {1..20}; do
+      current_state=$(sleep_state) || {
+        print -u2 'Could not verify system sleep state.'
+        return 1
+      }
+      if [[ ! -e $SERVICE_MARKER && $current_state == allowed ]]; then
+        break
+      fi
+      /bin/sleep 0.25
+    done
+    if [[ -e $SERVICE_MARKER || $current_state == disabled ]]; then
+      print -u2 'Service cleanup did not finish; restoring normal sleep.'
+      /usr/bin/pmset -a disablesleep 0 || return 1
+      current_state=$(sleep_state) || return 1
+      if [[ $current_state != allowed ]]; then
+        print -u2 'System sleep is still disabled. Run: sudo pmset -a disablesleep 0'
+        return 1
+      fi
+      /bin/rm -f "$SERVICE_MARKER" || return 1
+    fi
+  fi
+
+  remove_installed_files || return 1
+  print 'Service: stopped'
+}
+
+start_service() {
+  require_root || return 1
+  local source_status attempt
+  if job_running; then
+    print -u2 'Service is already running.'
+    return 1
+  fi
+  if [[ -e $SERVICE_MARKER ]]; then
+    print -u2 'A previous service session needs cleanup. Run: sudo ./lidawake service stop'
+    return 1
+  fi
+  source_status=$(/bin/zsh "$SOURCE_DIR/lidawake" status 2>&1) || {
+    print -u2 "$source_status"
+    return 1
+  }
+  if [[ $source_status == *'System sleep: disabled'* ]]; then
+    print -u2 'System sleep is already disabled. Stop its current owner before starting lidawake.'
+    return 1
+  fi
+  if job_info >/dev/null; then
+    /bin/launchctl bootout "$SERVICE_LABEL" || return 1
+  fi
+  if [[ -L $SERVICE_DIR || -L $SERVICE_SCRIPT || -L $SERVICE_CONFIG || -L $SERVICE_PLIST ]]; then
+    print -u2 'Refusing to install through a symbolic link.'
+    return 1
+  fi
+  if [[ -e $SERVICE_DIR && $(/usr/bin/stat -f '%u' "$SERVICE_DIR") != 0 ]]; then
+    print -u2 'Existing service directory must be owned by root.'
+    return 1
+  fi
+  if [[ $(/usr/bin/stat -f '%u' '/Library/Application Support') != 0 || $(/usr/bin/stat -f '%u' '/Library/LaunchDaemons') != 0 ]]; then
+    print -u2 'Service installation directories must be owned by root.'
+    return 1
+  fi
+  /usr/bin/plutil -lint "$SOURCE_DIR/service/local.lidawake.plist" >/dev/null || return 1
+  /usr/bin/install -d -o root -g wheel -m 755 "$SERVICE_DIR" || return 1
+  if ! /usr/bin/install -o root -g wheel -m 755 "$SOURCE_DIR/lidawake" "$SERVICE_SCRIPT" ||
+     ! /usr/bin/install -o root -g wheel -m 644 "$SOURCE_DIR/lidawake.conf" "$SERVICE_CONFIG" ||
+     ! /usr/bin/install -o root -g wheel -m 644 "$SOURCE_DIR/service/local.lidawake.plist" "$SERVICE_PLIST"; then
+    print -u2 'Could not install service files.'
+    remove_installed_files
+    return 1
+  fi
+  if ! /bin/launchctl bootstrap system "$SERVICE_PLIST"; then
+    print -u2 'Could not load the launchd service.'
+    stop_service
+    return 1
+  fi
+  if ! /bin/launchctl kickstart "$SERVICE_LABEL"; then
+    print -u2 'Could not start the launchd service.'
+    stop_service
+    return 1
+  fi
+  for attempt in {1..20}; do
+    if job_running && [[ -e $SERVICE_MARKER && $(sleep_state) == disabled ]]; then
+      print 'Service: running'
+      print 'Log: /var/log/lidawake.log'
+      return 0
+    fi
+    /bin/sleep 0.25
+  done
+  print -u2 'Service did not become active. Check /var/log/lidawake.log.'
+  stop_service
+  return 1
+}
+
+status_service() {
+  local running=false current_state
+  if job_running; then
+    running=true
+    print 'Service: running'
+  elif job_info >/dev/null || [[ -e $SERVICE_PLIST ]]; then
+    print 'Service: installed, not running'
+  else
+    print 'Service: stopped'
+  fi
+  current_state=$(sleep_state) || current_state=unknown
+  print "System sleep: $current_state"
+  if [[ -e $SERVICE_MARKER && $running != true ]]; then
+    print 'Recovery needed: run sudo ./lidawake service stop'
+  fi
+}
+
+if (( $# != 1 )); then
+  usage
+  exit 2
+fi
+case $1 in
+  start) start_service ;;
+  stop) stop_service ;;
+  status) status_service ;;
+  *) usage; exit 2 ;;
+esac

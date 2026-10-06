@@ -1,0 +1,276 @@
+#!/bin/zsh
+
+# A temporary closed-lid work session using only tools included with macOS.
+set -u
+
+PMSET=/usr/bin/pmset
+IOREG=/usr/sbin/ioreg
+DATE=/bin/date
+SLEEP=/bin/sleep
+SCRIPT_PATH=${0:A}
+CONFIG_FILE=${SCRIPT_PATH:h}/lidawake.conf
+SERVICE_SCRIPT='/Library/Application Support/lidawake/lidawake'
+SERVICE_MARKER='/Library/Application Support/lidawake/active'
+if [[ $SCRIPT_PATH == $SERVICE_SCRIPT ]]; then
+  SERVICE_MODE=true
+else
+  SERVICE_MODE=false
+fi
+
+usage() {
+  print -u2 'Usage: sudo ./lidawake [run [minutes|infinite] [battery_floor_percent]] | ./lidawake status | sudo ./lidawake restore | ./lidawake service start|stop|status'
+  print -u2 "Defaults are read from $CONFIG_FILE."
+}
+
+validate_settings() {
+  local duration=$1 floor=$2
+  if [[ $duration != infinite ]] && { [[ ! $duration == <-> || ${#duration} -gt 4 ]] || (( duration < 1 || duration > 1440 )); }; then
+    print -u2 'Duration must be infinite or 1–1440 minutes.'
+    return 2
+  fi
+  if [[ ! $floor == <-> || ${#floor} -gt 2 ]] || (( floor < 1 || floor > 99 )); then
+    print -u2 'Battery floor must be 1–99 percent.'
+    return 2
+  fi
+}
+
+load_config() {
+  local line duration_seen=false floor_seen=false
+  config_minutes=''
+  config_floor=''
+  if [[ ! -r $CONFIG_FILE ]]; then
+    print -u2 "Cannot read config: $CONFIG_FILE"
+    return 2
+  fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    case $line in
+      ''|'#'*) ;;
+      DURATION_MINUTES=*)
+        if [[ $duration_seen == true ]]; then
+          print -u2 'Duplicate setting: DURATION_MINUTES'
+          return 2
+        fi
+        config_minutes=${line#*=}
+        duration_seen=true
+        ;;
+      BATTERY_FLOOR_PERCENT=*)
+        if [[ $floor_seen == true ]]; then
+          print -u2 'Duplicate setting: BATTERY_FLOOR_PERCENT'
+          return 2
+        fi
+        config_floor=${line#*=}
+        floor_seen=true
+        ;;
+      *)
+        print -u2 "Unknown setting: $line"
+        return 2
+        ;;
+    esac
+  done < "$CONFIG_FILE"
+  if [[ $duration_seen != true || $floor_seen != true ]]; then
+    print -u2 'Missing setting: DURATION_MINUTES or BATTERY_FLOOR_PERCENT'
+    return 2
+  fi
+  validate_settings "$config_minutes" "$config_floor"
+}
+
+power_state() {
+  "$IOREG" -r -n IOPMrootDomain -d 1
+}
+
+sleep_is_disabled() {
+  [[ $1 == *'"SleepDisabled" = Yes'* ]]
+}
+
+sleep_is_allowed() {
+  [[ $1 == *'"SleepDisabled" = No'* ]]
+}
+
+lid_is_closed() {
+  [[ $1 == *'"AppleClamshellState" = Yes'* ]]
+}
+
+battery_percent() {
+  "$PMSET" -g batt | /usr/bin/awk '
+    /InternalBattery/ && match($0, /[0-9]+%/) {
+      print substr($0, RSTART, RLENGTH - 1)
+      exit
+    }
+  '
+}
+
+require_root() {
+  if (( EUID != 0 )); then
+    print -u2 'Run this command with sudo.'
+    exit 1
+  fi
+}
+
+restore_sleep() {
+  if [[ $owns_sleep_override == true ]]; then
+    print 'Restoring normal sleep.'
+    if ! "$PMSET" -a disablesleep 0; then
+      print -u2 'Could not restore sleep. Run: sudo pmset -a disablesleep 0'
+      return 1
+    fi
+    local state
+    state=$(power_state) || return 1
+    if ! sleep_is_allowed "$state"; then
+      print -u2 'System sleep is still disabled. Run: sudo pmset -a disablesleep 0'
+      return 1
+    fi
+    owns_sleep_override=false
+    if [[ $SERVICE_MODE == true ]]; then
+      /bin/rm -f "$SERVICE_MARKER" || return 1
+    fi
+    print 'Normal sleep restored.'
+  fi
+}
+
+case ${1:-run} in
+  service)
+    if (( $# != 2 )); then
+      print -u2 'Usage: lidawake service start | stop | status'
+      exit 2
+    fi
+    exec /bin/zsh "${SCRIPT_PATH:h}/service-control" "$2"
+    ;;
+  status)
+    load_config || exit 2
+    state=$(power_state) || exit 1
+    if sleep_is_disabled "$state"; then
+      print 'System sleep: disabled'
+    else
+      print 'System sleep: allowed'
+    fi
+    if lid_is_closed "$state"; then
+      print 'Lid: closed'
+    else
+      print 'Lid: open'
+    fi
+    print "Battery: $(battery_percent)%"
+    if [[ $config_minutes == infinite ]]; then
+      print 'Duration: infinite'
+    else
+      print "Duration: $config_minutes minutes"
+    fi
+    print "Battery floor: $config_floor%"
+    ;;
+  restore)
+    require_root
+    "$PMSET" -a disablesleep 0
+    ;;
+  run)
+    if (( $# > 3 )); then
+      usage
+      exit 2
+    fi
+    load_config || exit 2
+    minutes=${2:-$config_minutes}
+    floor=${3:-$config_floor}
+    validate_settings "$minutes" "$floor" || exit 2
+    require_root
+
+    state=$(power_state) || exit 1
+    if [[ $state != *'"AppleClamshellState"'* ]]; then
+      print -u2 'No laptop lid was detected.'
+      exit 1
+    fi
+    if sleep_is_disabled "$state"; then
+      print -u2 'System sleep is already disabled. Restore its current owner before starting lidawake.'
+      exit 1
+    fi
+
+    owns_sleep_override=true
+    trap 'restore_sleep' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+
+    if ! "$PMSET" -a disablesleep 1; then
+      print -u2 'Could not disable system sleep.'
+      exit 1
+    fi
+    state=$(power_state) || exit 1
+    if ! sleep_is_disabled "$state"; then
+      print -u2 'System sleep did not become disabled.'
+      exit 1
+    fi
+    if [[ $SERVICE_MODE == true ]]; then
+      if ! /usr/bin/touch "$SERVICE_MARKER" || ! /bin/chmod 600 "$SERVICE_MARKER"; then
+        print -u2 'Could not record service state.'
+        exit 1
+      fi
+    fi
+
+    deadline=''
+    if [[ $minutes != infinite ]]; then
+      deadline=$(( $($DATE +%s) + minutes * 60 ))
+    fi
+    lid_was_closed=false
+    if [[ $minutes == infinite ]]; then
+      print "Closed-lid mode active without a time limit; battery floor $floor%."
+    else
+      print "Closed-lid mode active for $minutes minutes; battery floor $floor%."
+    fi
+    if [[ $SERVICE_MODE == true ]]; then
+      print 'Stop this session with: sudo ./lidawake service stop'
+    else
+      print 'Keep this Terminal command running. Press Control-C to restore normal sleep.'
+    fi
+
+    while true; do
+      if [[ -n $deadline ]] && (( $($DATE +%s) >= deadline )); then
+        print 'Time limit reached. Restoring normal sleep.'
+        break
+      fi
+
+      percent=$(battery_percent)
+      if [[ ! $percent == <-> ]]; then
+        print -u2 'Could not read battery level. Restoring normal sleep.'
+        exit 1
+      fi
+      if (( percent <= floor )); then
+        print "Battery reached $percent%. Restoring normal sleep."
+        break
+      fi
+
+      state=$(power_state) || exit 1
+      if ! sleep_is_disabled "$state"; then
+        if ! "$PMSET" -a disablesleep 1; then
+          print -u2 'Could not keep system sleep disabled.'
+          exit 1
+        fi
+        state=$(power_state) || exit 1
+        if ! sleep_is_disabled "$state"; then
+          print -u2 'System sleep is still enabled.'
+          exit 1
+        fi
+      fi
+      if lid_is_closed "$state"; then
+        if [[ $lid_was_closed == false ]]; then
+          "$SLEEP" 2
+          state=$(power_state) || exit 1
+          if lid_is_closed "$state"; then
+            if ! "$PMSET" displaysleepnow; then
+              print -u2 'Could not turn off the display. Restoring normal sleep.'
+              exit 1
+            fi
+            print 'Lid closed: display off.'
+          fi
+        fi
+        lid_was_closed=true
+      else
+        lid_was_closed=false
+      fi
+
+      "$SLEEP" 2
+    done
+    restore_sleep || exit 1
+    trap - EXIT
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
